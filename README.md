@@ -21,8 +21,7 @@ Installation Guide: https://github.com/Intelligent-Quads/iq_tutorials/tree/maste
 For the scripts above, you will need the following python libraries:
 dronekit,
 rospy,
-pymavlink,
-
+pymavlink, 
 threading,
 cv2,
 time,
