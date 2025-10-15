@@ -1,0 +1,382 @@
+from dronekit import connect, VehicleMode, LocationGlobalRelative
+import time
+import math
+import cv2
+import requests
+import rospy
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from pymavlink import mavutil
+import threading
+import random
+
+print("connecting to vehicle")
+vehicle = connect('127.0.0.1:14550', wait_ready=True)
+print("connected to vehicle")
+
+ML_API_URL = "https://predict.ultralytics.com"
+HEADERS = {"x-api-key": "929ca9573e76459c642e4b08f65cbb1bbaf8a1f6bf"}
+MODEL_DATA = {
+    "model": "https://hub.ultralytics.com/models/RJT1svwxBfBKFCUmFzUt",
+    "imgsz": 640,
+    "conf": 0.25,
+    "iou": 0.45
+}
+
+class drone_init:
+    def __init__(self, width, length, height):
+        self.width = width  
+        self.length = length  
+        self.height = height
+        self.bridge = CvBridge()
+        self.image = None
+        self.stop_circling = False
+
+        rospy.init_node('image_listener', anonymous=True)
+        rospy.Subscriber("/webcam/image_raw", Image, self.image_callback)
+
+    def image_callback(self, msg):
+        self.image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def takeoff(self):
+        print("taking off...")
+        while not vehicle.is_armable:
+            print(" waiting for vehicle to become armable...")
+            time.sleep(1)
+        vehicle.mode = VehicleMode("GUIDED")
+        vehicle.armed = True
+        while not vehicle.armed:
+            print("waiting for arming...")
+            time.sleep(1)
+        vehicle.simple_takeoff(self.height)
+        while True:
+            print(f" Altitude: {vehicle.location.global_relative_frame.alt:.2f}")
+            if vehicle.location.global_relative_frame.alt >= self.height * 0.95:
+                print("reached target altitude")
+                break
+            time.sleep(0.5)  
+        self.start_lat = vehicle.location.global_relative_frame.lat
+        self.start_lon = vehicle.location.global_relative_frame.lon
+        self.start_alt = vehicle.location.global_relative_frame.alt
+        print(f"Home location set: {self.start_lat}, {self.start_lon}, {self.start_alt}")
+    
+    def move_to(self, lat, lon, alt):
+        print(f"Moving to {lat}, {lon}, {alt}")
+        point = LocationGlobalRelative(lat, lon, alt)
+        vehicle.simple_goto(point, airspeed=3.0)
+        time.sleep(5)
+
+    def move_to_fast(self, lat, lon, alt):
+        point = LocationGlobalRelative(lat, lon, alt)
+        vehicle.simple_goto(point, airspeed=4.0)
+        time.sleep(0.5)
+
+    def scan_area(self):
+        print(f"Scanning area {self.width}m x {self.length}m at {self.height}m altitude.")
+        vehicle.airspeed = 2.0
+        self.zigzagsearch()
+
+    def zigzagsearch(self): #tested
+        lat, lon = self.start_lat, self.start_lon  
+        lat_step = (self.length / 111320) 
+        lon_step = (self.width / (111320 * math.cos(math.radians(lat))))  
+        print(lon_step)
+        avg_size = (self.length + self.width) / 2
+        num_passes = (avg_size / 10) * 2
+        num_passes = int(num_passes) 
+        half_lon_step = lon_step / 2
+        print(half_lon_step)
+        print(f"Number of passes adjusted to: {num_passes}") 
+        for i in range(num_passes):
+            mid_lon = lon + half_lon_step if i % 2 == 0 else lon - half_lon_step  
+            end_lon = lon + lon_step if i % 2 == 0 else lon - lon_step  
+            #end_lon = lon+lon_step if i % 2==0 else self.start_lon
+            self.move_to(lat, mid_lon, self.height) 
+            print("Sleeping due to inference")
+            time.sleep(0.5) 
+            if self.run_inference():
+                self.fly_to_target(lat, mid_lon)
+                return  
+            print("moving to end")
+            self.move_to(lat, end_lon, self.height)  
+            if self.run_inference():
+                self.fly_to_target(lat, end_lon)
+                return  
+            lat += lat_step / num_passes
+        print("Zigzag scan complete. No target detected. Returning home and landing.")
+        self.return_to_home()
+
+    def grid_search(self):  #tested
+        lat, lon = self.start_lat, self.start_lon
+        num_rows = int((self.width / 10)*2)
+        print(num_rows)
+        num_cols = int((self.length / 10) * 1)
+        print(num_cols)
+        lat_step = (30 / num_rows) / 111320  
+        lon_step = (30 / num_cols) / (111320 * math.cos(math.radians(lat)))
+        for i in range(num_rows):
+            if i % 2 == 0:
+                for j in range(num_cols):
+                    current_lon = self.start_lon - j * lon_step  
+                    self.move_to(lat, current_lon, self.height)
+                    #print("Sleeping due to inference")
+                    #time.sleep(0.2)
+                    #if self.run_inference():
+                        #self.fly_to_target(lat, current_lon)
+                        #return
+            else:
+                for j in range(num_cols):
+                    current_lon = self.start_lon - (num_cols - j - 1) * lon_step  
+                    self.move_to(lat, current_lon, self.height)
+                    #print("Sleeping due to inference")
+                    #time.sleep(0.2)
+                    #if self.run_inference():
+                        #self.fly_to_target(lat, current_lon)
+                        #return
+            lat -= lat_step  
+        print("Grid search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def snake_search(self): #tested
+        lat, lon = self.start_lat, self.start_lon
+        size = 30  
+        step = 10   
+        while size > 0:
+            corners = [
+                (lat, lon),                          
+                (lat, lon - size / (111320 * math.cos(math.radians(lat)))),  
+                (lat - size / 111320, lon - size / (111320 * math.cos(math.radians(lat)))),  
+                (lat - size / 111320, lon)               
+            ]
+            for corner_lat, corner_lon in corners:
+                self.move_to(corner_lat, corner_lon, self.height)
+                print("Sleeping due to inference")
+                time.sleep(0.2)
+                #if self.run_inference():
+                    #self.fly_to_target(corner_lat, corner_lon)
+                    #return
+            lat -= step / 111320  
+            lon -= step / (111320 * math.cos(math.radians(lat)))  
+            size -= 2 * step  
+        print("Snake search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def spiral_search(self):   #tested
+        lat, lon = self.start_lat, self.start_lon
+        step = (30 / 6) / 111320
+        radius = step
+        angle_step = 30  
+        for angle in range(0, 720, angle_step):
+            new_lat = lat - (radius * math.cos(math.radians(angle)))
+            new_lon = lon - (radius * math.sin(math.radians(angle)))
+            self.move_to(new_lat, new_lon, self.height)
+            #time.sleep(0.2)
+
+            #if self.run_inference():
+                #self.fly_to_target(new_lat, new_lon)
+                #return
+            radius += step / 4  
+        print("Spiral search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def random_walk_search(self):
+        lat, lon = self.start_lat, self.start_lon
+        step = (30 / 6) / 111320
+        for _ in range(10):  
+            random_lat = lat - random.choice([-step, step])
+            random_lon = lon - random.choice([-step, step])
+            self.move_to(random_lat, random_lon, self.height)
+            time.sleep(0.2)
+
+            #if self.run_inference():
+                #self.fly_to_target(random_lat, random_lon)
+                #return
+        print("Random walk search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def concentric_circles_search(self):
+        lat, lon = self.start_lat, self.start_lon
+        step = (30 / 6) / 111320
+        radius = step
+        for _ in range(4):  
+            for angle in range(0, 360, 45):
+                new_lat = lat - (radius * math.cos(math.radians(angle)))
+                new_lon = lon - (radius * math.sin(math.radians(angle)))
+                self.move_to(new_lat, new_lon, self.height)
+                #time.sleep(0.2)
+                #if self.run_inference():
+                    #self.fly_to_target(new_lat, new_lon)
+                    #return
+            radius += step
+        print("Concentric circles search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def star_search(self):
+        lat, lon = self.start_lat, self.start_lon
+        step = (30 / 6) / 111320
+        angles = [0, 72, 144, 216, 288]  
+        for angle in angles:
+            new_lat = lat - (step * math.cos(math.radians(angle)))
+            new_lon = lon - (step * math.sin(math.radians(angle)))
+            self.move_to(new_lat, new_lon, self.height)
+            time.sleep(0.2)
+            #if self.run_inference():
+                #self.fly_to_target(new_lat, new_lon)
+                #return
+        print("Star search complete. No target detected. Returning home.")
+        self.return_to_home()
+    def circle_search(self):
+        lat, lon = self.start_lat, self.start_lon  
+        area_size = 30 
+
+        lat_step = (area_size / 3) / 111320  
+        lon_step = (area_size / 3) / (111320 * math.cos(math.radians(lat)))
+
+        search_points = [
+            (lat + lat_step, lon + lon_step),  #top-left
+            (lat + lat_step, lon - lon_step),  #topoo-right
+            (lat - lat_step, lon + lon_step),  #bottom-left
+            (lat - lat_step, lon - lon_step),  #bottom-right
+        ]
+
+        print(f"Scanning {len(search_points)} key points from ({lat:.6f}, {lon:.6f})")
+
+        for target_lat, target_lon in search_points:
+            
+            self.move_to(target_lat, target_lon, self.height)
+            print(f"Scanning at ({target_lat:.6f}, {target_lon:.6f})")
+            time.sleep(5)
+            print("sleeping before rotating")
+
+            for angle in [0, 90, 180, 270, 360]:
+                self.set_yaw(angle)  
+                print(f"Rotating to {angle}° and scanning...")
+                print("running inference")
+                self.run_inference()  
+                print("skipped scanning")
+                time.sleep(2)
+                print("done sleeping")
+                print(angle)
+            print("point completed, moving to next")
+            time.sleep(1)
+            self.set_yaw(0)
+            print("yaw reset, moving to next point")
+        print("Circle search complete. No target detected. Returning home.")
+        self.return_to_home()
+
+    def set_yaw(self, heading, relative=False):
+        """
+        Set drone's yaw to a specific heading using DroneKit.
+        :param heading: Desired yaw angle (0-360 degrees)
+        :param relative: If True, yaw change is relative to current heading
+        """
+
+        is_relative = 1 if relative else 0
+        msg = vehicle.message_factory.command_long_encode(
+            0, 0,    
+            mavutil.mavlink.MAV_CMD_CONDITION_YAW, 
+            0,       
+            heading,  
+            30,  # Speed (degrees/sec)
+            1,   # Direction: 1 for clockwise, -1 for counterclockwise
+            is_relative, 
+            0, 0, 0  
+        )
+        vehicle.send_mavlink(msg)
+        vehicle.flush()
+
+
+    def run_inference(self):
+        print("Running inference")
+        if self.image is None:
+            print("No image received yet.")
+            return False
+        
+        cv2.imwrite("image.png", self.image)
+        with open("image.png", "rb") as f:
+            response = requests.post(ML_API_URL, headers=HEADERS, data=MODEL_DATA, files={"file": f})
+        
+        response.raise_for_status()
+        results = response.json()['images'][0]['results']
+        
+        print("Sleeping due to inference")
+        time.sleep(2)
+        
+        if results and results[0]['name'] == "person":
+            print("Person detected!")
+            return True
+        print("No person detected )")
+        return False
+
+    def fly_to_target(self, lat, lon):
+        print(f"Flying to target at {lat}, {lon}")
+        self.move_to_fast(lat, lon, self.height / 2)
+        self.circle_target(lat, lon)
+
+    def circle_target(self, lat, lon):
+        radius_meters = 15
+        num_points = 12 
+
+        radius_lat = radius_meters / 111320  
+        radius_lon = radius_meters / (111320 * math.cos(math.radians(lat)))  
+
+        print(f"Circling above target with a {radius_meters}m radius. Type 's' to return to base.")
+
+        def user_input_listener():
+            while True:
+                user_input = input("Type 's' to return to base: ")
+                if user_input.lower() == 's':
+                    self.stop_circling = True
+                    break
+
+        threading.Thread(target=user_input_listener, daemon=True).start()
+
+        while not self.stop_circling:
+            for i in range(num_points):
+                if self.stop_circling:
+                    break
+                angle = i * (360 / num_points)
+                offset_lat = lat + (radius_lat * math.cos(math.radians(angle)))
+                offset_lon = lon + (radius_lon * math.sin(math.radians(angle)))
+                print(f"(Moving to [{offset_lat}], [{offset_lon}] for the circle)")
+                self.move_to_fast(offset_lat, offset_lon, self.height / 2)
+
+        print("Finished circling.")
+        self.return_to_home()
+    def return_to_home(self):
+        print(f"Returning to home at {self.start_lat}, {self.start_lon}, {self.start_alt}")
+        state = True
+        while state:
+            self.move_to(self.start_lat, self.start_lon, self.start_alt)
+            print(f"current lat: {vehicle.location.global_relative_frame.lat}")
+            if abs(self.start_lat - vehicle.location.global_relative_frame.lat) <= 0.00005 and abs(self.start_lon - vehicle.location.global_relative_frame.lon) <= 0.00005:
+                print (self.start_lat - vehicle.location.global_relative_frame.lat)
+                print(self.start_lon - vehicle.location.global_relative_frame.lon)
+                print("reached home")
+                state = False
+        print("landing")
+        self.land()
+
+    def land(self):
+        print("Landing...")
+        vehicle.mode = VehicleMode("LAND")
+        while vehicle.armed:
+            print(" Waiting for landing...")
+            time.sleep(1)
+        print("Landed successfully.")
+
+
+try:
+    width = float(input("Enter search area width (m): "))
+    length = float(input("Enter search area length (m): "))
+    height = float(input("Enter search altitude (m): "))
+
+    drone = drone_init(width, length, height)
+    drone.takeoff()
+    drone.scan_area()
+
+finally:
+    print("error")
+    drone.return_to_home()
+    print("Closing vehicle connection...")
+    vehicle.close()
