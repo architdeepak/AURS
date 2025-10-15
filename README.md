@@ -19,14 +19,14 @@ Installation Guide: https://github.com/Intelligent-Quads/iq_tutorials/tree/maste
 # Installations
 
 For the scripts above, you will need the following python libraries:
-dronekit 
-rospy
-pymavlink
+dronekit,
+rospy,
+pymavlink,
 
-threading
-cv2
-time
-requests
-random
+threading,
+cv2,
+time,
+requests,
+random,
 
 
